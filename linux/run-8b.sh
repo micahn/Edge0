@@ -7,6 +7,11 @@
 # Flags here are the measured-best config for a single-user chat workload on
 # Ryzen 7 5800X + RX 9070; see linux/README.md "Tuning" for the full matrix.
 # Env overrides: EDGE0_PORT EDGE0_CTX EDGE0_NP EDGE0_POOL_MB EDGE0_NO_LORA=1
+#
+# CTX defaults to 131072, the checkpoint native window. Do NOT lower it below 32768 while
+# driving this through opencode: its system prompt plus ~59 MCP tool definitions exceeds 8k
+# tokens, so a smaller window makes every session try to compact before its first token and
+# fail with "The compaction request cannot be reduced further".
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -17,7 +22,7 @@ MODEL="${EDGE0_8B_GGUF:-$ROOT/models/edge0-8b-gguf/edge0-8b.gguf}"
 LORA="${EDGE0_8B_LORA:-$ROOT/models/edge0-8b/lora_edge0_8b-gguf.gguf}"
 POOL_MB="${EDGE0_POOL_MB:-512}"
 PORT="${EDGE0_PORT:-8081}"
-CTX="${EDGE0_CTX:-8192}"
+CTX="${EDGE0_CTX:-131072}"
 NP="${EDGE0_NP:-1}"          # 1 slot: the server default (4, unified KV) costs ~15% on single-user chat
 
 [ -x "$BIN/llama-server" ] || { echo "engine not built: bash linux/scripts/vendor-build.sh" >&2; exit 1; }

@@ -130,18 +130,23 @@ sentinel sha, `ssm_ba` permutation reversibility, `exp` dual-path). Read the emi
 ## Run
 
 ```bash
-bash linux/run-8b.sh
+bash linux/run-8b.sh      # port 8081
+bash linux/run-35b.sh     # port 8082 — don't run both, see the 35B section
 ```
 
 Then open **http://127.0.0.1:8081/** — llama.cpp ships its own SvelteKit web UI, served
 from the server root. No separate frontend needed.
+
+Both tiers are hybrid-attention models with a 131072-token native window, and both are launched
+at it. See **Context window** for why that is cheap here and why you should not lower it.
 
 > The built-in UI is served **gzip only**. `curl http://127.0.0.1:8081/` returns
 > `415 Error: gzip is not supported by this browser`; that's expected, not a failure. Use
 > `curl --compressed ...` or just open a real browser.
 
 The script's flags are the measured-best single-user chat config (see **Tuning**). Override
-via `EDGE0_PORT EDGE0_CTX EDGE0_NP EDGE0_POOL_MB EDGE0_NO_LORA=1`.
+via `EDGE0_PORT EDGE0_CTX EDGE0_NP EDGE0_POOL_MB EDGE0_NO_LORA=1` (and `EDGE0_35B_PORT`,
+`EDGE0_35B_CTX` for the 35B).
 
 For API access:
 
@@ -153,6 +158,72 @@ curl http://127.0.0.1:8081/v1/chat/completions \
 
 The model emits a long `reasoning_content` block before its answer. Skip it with
 `"chat_template_kwargs": {"enable_thinking": false}` (the web UI has a toggle for this).
+
+### The 35B tier
+
+```bash
+bash linux/run-35b.sh          # port 8082 — the tiers have separate ports, but see below
+```
+
+The two tiers use different ports (8B on 8081, 35B on 8082) so only one has to be down at a
+time. **Don't run both at once**: 5 GB + 21.75 GB of weights against 31 GB of RAM.
+
+**The 35B is ~4× *slower* than the 8B on this machine, not faster.** It is a bigger model,
+not a better one here — the GGUF is 21.75 GB against 31 GB of RAM, peak RSS hits 17.7 GB, and
+the OS pages. Serve the 8B unless you specifically want the 35B's quality.
+
+| tier | ctx | prompt | prefill | decode | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| edge0-8b | 131072 | 47k tok | 865 tok/s | 85 tok/s | 4.8 GiB |
+| edge0-35b | 131072 | 56k tok | 466 tok/s | **11.4 tok/s** | 17.7 GiB |
+| edge0-35b | 8192 | 242 tok | 302 tok/s | 24 tok/s | 16.9 GiB |
+
+Decode is stable across prompt length (23-24 tok/s at 8k ctx on both a 23-token and a
+242-token prompt), so the penalty is structural rather than a warm-up artifact. The gap widens
+with context because the 35B is already paging before the KV cache is a factor.
+
+**The prerouter head is live on this tier only.** Upstream hardcodes its shapes to 35B
+(`E=256/K=4`, owners 6..38), so the INIT trace reads `heads=33 gates=33 map=ok` on 35B versus
+`heads=0` (dormant) on 8B. First measured overlap:
+
+```
+[pref-trace] step 64: head 22.5%  sticky 14.9%  rand 1.2%
+```
+
+The head beats both baselines — random at 1.2% confirms routing is genuinely hard to predict
+without the trained head, and the head's 22.5% is the mechanism earning its keep. Treat that
+figure as provisional: it comes from a short sample, and the head's value should be measured
+over a long generation before being quoted.
+
+## Context window
+
+Both launchers default to **131072** — each checkpoint's native limit. Override with
+`E0_CTX=65536 bash linux/run-8b.sh` or `EDGE0_8B_CTX` / `EDGE0_35B_CTX`.
+
+| tier | ctx | prompt tested | prefill | decode | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| 8B | 131072 | 47k tok | 865 tok/s | 85 tok/s | 4.8 GiB |
+| 35B | 131072 | 56k tok | 466 tok/s | 11.4 tok/s | 17.7 GiB |
+
+A long window is cheap here because edge0 is **hybrid attention**: only every 4th layer carries
+a KV cache and the rest are O(1) linear state, so KV cost grows far more slowly than in a dense
+model. The 8B holds its entire 131k window in 4.8 GiB of RSS.
+
+**Do not go below 32768.** That floor is not a model limit — it's an OpenCode limit. OpenCode's
+system prompt plus ~59 MCP tool definitions exceeds 8k tokens, so at `-c 8192` every session
+attempts compaction before its first token and fails with *"The compaction request cannot be
+reduced further without losing the latest exchange or checkpoint"*. That reads like OpenCode is
+broken, not like a config error. If you drive the API directly rather than through OpenCode,
+smaller windows are fine.
+
+262144 is accepted by the scripts but untested here.
+
+### A trap when testing long context
+
+Do not probe with repeated filler (`"the quick brown fox" * N`). It is not a neutral input:
+the 35B reads it as noise and emits EOS immediately, which reads as **0 tok/s decode and looks
+like the long context is unusable**. Real prose at 131k gave a coherent answer at 11.4 tok/s.
+If you measure a suspiciously perfect zero, suspect your prompt before your configuration.
 
 ## Tuning
 
@@ -184,15 +255,18 @@ What matters, and what doesn't:
 
 ### Why there's no big win left
 
-During decode this system runs at **6-9% GPU utilization with ~9 GB of VRAM free**, 88%
+During 8B decode this system runs at **6-9% GPU utilization with ~9 GB of VRAM free**, 88%
 idle CPU, and zero disk reads. Nothing is saturated. The workload is latency-bound at the
 graph-submission level rather than throughput-bound, which is why adding threads, VRAM, or
 pool capacity doesn't move the number. For reference, `llama-bench` reports ~153 tok/s
 `tg32` in isolation versus ~97 through the HTTP server — that gap is request-path overhead
 (template rendering, sampling, SSE), not something engine flags can recover.
 
-The two real levers are therefore: **more capable hardware** (the GPU is nearly idle, so a
-faster GPU helps proportionally), and **the LoRA trade** above.
+The 35B is the exception that proves it: it *is* memory-bound, because it doesn't fit. More
+RAM is the lever there, not more threads.
+
+The two real levers for 8B are therefore: **more capable hardware** (the GPU is nearly idle,
+so a faster GPU helps proportionally), and **the LoRA trade** above.
 
 ### Engine env gates
 
@@ -246,5 +320,6 @@ its answer — that is the trained behavior, not a defect. Pass
   path still works.
 - **`RADV prints a conformance warning** on startup ("not a conformant Vulkan implementation,
   testing use only"). It is informational, and results above were produced with it.
-- **The 35B tier has not been benchmarked here.** It converts and loads, but 31 GB of RAM
-  against a ~21 GB GGUF is paging-bound; treat its numbers as unmeasured.
+- **The 35B tier is memory-bound, not GPU-bound.** It converts GREEN (703 tensors, 372/372
+  sentinel gates) and answers correctly, but runs ~4× slower than the 8B because 21.75 GB of
+  weights don't fit in 31 GB of RAM. Its numbers above are real measurements, not projections.
